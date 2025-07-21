@@ -3,11 +3,19 @@ import os
 import time
 import yaml
 import pickle
+import pandas as pd # 导入pandas用于后续结果处理
 from shutil import copytree, ignore_patterns
 import argparse
 import numpy as np
 from tqdm import tqdm
 from collections import OrderedDict
+
+# [DDP修改] 1. 导入分布式训练所需的新模块
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
 from tensorboardX import SummaryWriter
 import torch
 import torch.nn as nn
@@ -20,532 +28,909 @@ from torch.utils.data.sampler import WeightedRandomSampler
 
 from tools.utils import seed_torch, str2bool, str2list, get_graph_name, import_class, coef_list, Prior
 from settle_results import SettleResults
+import warnings
+warnings.filterwarnings("ignore", message=".*does not have a deterministic implementation.*")
 TF_ENABLE_ONEDNN_OPTS = 0
-torch.use_deterministic_algorithms(True)
+# 使用warn_only选项，允许非确定性操作但会发出警告
+torch.use_deterministic_algorithms(True, warn_only=True)
 os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 
 
 def get_parser():
     # parameter priority: command line > config > default
-    parser = argparse.ArgumentParser(description='')
-    parser.add_argument('--exp_name', default='')
-    parser.add_argument('--save_dir', default='./results', help='the work folder for storing results')
-    parser.add_argument('--data_dir', default='./')
-    parser.add_argument('--config', default='./train_causal.yaml', help='path to the configuration file')
-    parser.add_argument('--seed', default=1, type=int, help='seed for random')
-    parser.add_argument('--split_seed', default=1, type=int)
-    parser.add_argument('--fold', default=0, type=int, help='0-4, fold idx for cross-validation')
-    parser.add_argument('--data_name', default='arising_2_0n0', type=str)
-    parser.add_argument('--patch_size', default=5, type=int)
-
-    # visualize and debug
-    parser.add_argument('--save_score', type=str2bool, default=True,
-                        help='if ture, the classification score will be stored')
-    parser.add_argument('--log_interval', type=int, default=100, help='the interval for printing messages (#iteration)')
-    parser.add_argument('--save_interval', type=int, default=5, help='the interval for storing models (#iteration)')
-    parser.add_argument('--eval_interval', type=int, default=5, help='the interval for evaluating models (#iteration)')
-    parser.add_argument('--print_log', type=str2bool, default=True, help='print logging or not')
-
-    # feeder
-    parser.add_argument('--feeder', default='tools.feeder.Feeder', help='data loader will be used')
-    parser.add_argument('--num_worker', type=int, default=0, help='the number of worker for data loader')
-    parser.add_argument('--train_feeder_args', default=dict(), help='the arguments of data loader for training')
-    parser.add_argument('--test_feeder_args', default=dict(), help='the arguments of data loader for test')
-
-    # model
-    parser.add_argument('--graph_args', default=dict(), help='the arguments of model')  # type=dict,
-    parser.add_argument('--model', default=None, help='the model will be used')
-    parser.add_argument('--model_args', default=dict(), help='the arguments of model')  # type=dict,
-
-    # hyper-parameters
-    parser.add_argument('--pre_epoch', type=int, default=0)
-    parser.add_argument('--inc_mode', type=str, default='lin')
-    parser.add_argument('--LO', type=float, default=0)
-    parser.add_argument('--LR', type=float, default=0)
-    parser.add_argument('--LG', type=float, default=0)
-
-    # optimizer
-    parser.add_argument('--base_lr', type=float, default=0.001, help='initial learning rate')
-    parser.add_argument('--base_lr_mask', type=float, default=0.001, help='initial learning rate')
-    parser.add_argument('--scheduler', type=str, default='step', help='scheduler')
-    parser.add_argument('--stepsize', type=int, default=30, help='scheduler step size')
-    parser.add_argument('--gamma', type=float, default=0.5, help='scheduler shrinking rate')
-    parser.add_argument('--device', type=int, default=0, nargs='+', help='the indexes of GPUs for training or testing')
-    parser.add_argument('--optimizer', default='SGD', help='type of optimizer')
-    parser.add_argument('--nesterov', type=str2bool, default=False, help='use nesterov or not')
-    parser.add_argument('--weight_decay', type=float, default=0.0005, help='weight decay for optimizer')
-    parser.add_argument('--batch_size', type=int, default=50, help='training batch size')
-    parser.add_argument('--test_batch_size', type=int, default=50, help='test batch size')
-    parser.add_argument('--start_epoch', type=int, default=0, help='start training from which epoch')
-    parser.add_argument('--num_epoch', type=int, default=80, help='stop training in which epoch')
+    parser = argparse.ArgumentParser(description='Causal Graph Neural Network for Parkinson\'s Disease Detection')
+    
+    # 基本配置
+    parser.add_argument('--exp_name', default='', type=str, help='实验名称')
+    parser.add_argument('--save_dir', default='./results', type=str, help='结果保存文件夹')
+    parser.add_argument('--data_dir', default='./', type=str, help='数据目录')
+    parser.add_argument('--config', default='./train_causal.yaml', type=str, help='配置文件路径')
+    
+    # 随机种子和数据分割
+    parser.add_argument('--seed', default=1, type=int, help='随机种子')
+    parser.add_argument('--split_seed', default=1, type=int, help='交叉验证分割随机种子')
+    parser.add_argument('--fold', default=0, type=int, help='交叉验证折数(0-4)')
+    
+    # 数据参数
+    parser.add_argument('--data_name', default='arising_2_0n0', type=str, help='数据集名称')
+    parser.add_argument('--patch_size', default=5, type=int, help='脑部补丁大小')
+    
+    # 训练参数
+    parser.add_argument('--pre_epoch', type=int, default=30, help='预训练阶段的轮数')
+    parser.add_argument('--num_epoch', type=int, default=150, help='总训练轮数')
+    parser.add_argument('--stage_transition_epoch', type=int, default=100, help='阶段转换轮数')
+    parser.add_argument('--batch_size', type=int, default=32, help='总训练批次大小 (会被分配到各个GPU)')
+    parser.add_argument('--test_batch_size', type=int, default=32, help='测试批次大小')
+    parser.add_argument('--inc_mode', type=str, default='lin', help='增长模式: lin(线性), log(对数), power(幂)')
+    
+    # 优化器参数
+    parser.add_argument('--optimizer', type=str, default='SGD', help='优化器类型')
+    parser.add_argument('--base_lr', type=float, default=0.0001, help='初始学习率')
+    parser.add_argument('--base_lr_mask', type=float, default=16, help='掩码学习率')
+    parser.add_argument('--scheduler', type=str, default='auto', help='学习率调度器')
+    parser.add_argument('--stepsize', type=int, default=10, help='调度器步长')
+    parser.add_argument('--gamma', type=float, default=0.5, help='学习率衰减率')
+    parser.add_argument('--weight_decay', type=float, default=0.0005, help='权重衰减')
+    parser.add_argument('--nesterov', type=str2bool, default=True, help='是否使用Nesterov动量')
+    
+    # 损失权重
+    parser.add_argument('--LC', type=float, default=1.0, help='因果损失权重')
+    parser.add_argument('--LO', type=float, default=1, help='反事实损失权重')
+    parser.add_argument('--LCI', type=float, default=1, help='因果不变性损失权重')
+    parser.add_argument('--LCV', type=float, default=1, help='因果变异性损失权重')
+    parser.add_argument('--LG', type=float, default=0.002, help='引导损失权重')
+    parser.add_argument('--lambda_l1', type=float, default=0.0001, help='L1正则化强度')
+    
+    # 模型参数
+    parser.add_argument('--model', default='net.networks', help='模型类')
+    parser.add_argument('--model_args', default=dict(), help='模型参数')
+    parser.add_argument('--pretrained_path', default=None, type=str, help='预训练模型路径')
+    parser.add_argument('--freeze_extractor', type=str2bool, default=True, help='是否冻结特征提取器')
+    
+    # 图构建参数
+    parser.add_argument('--graph_args', default=dict(), help='图构建参数')
+    parser.add_argument('--feeder', default='tools.feeder.FeederGraph', help='数据加载器')
+    
+    # 可视化和调试
+    parser.add_argument('--save_score', type=str2bool, default=True, help='是否保存分类得分')
+    parser.add_argument('--log_interval', type=int, default=100, help='打印消息的间隔(#迭代)')
+    parser.add_argument('--save_interval', type=int, default=5, help='保存模型的间隔(#迭代)')
+    parser.add_argument('--eval_interval', type=int, default=5, help='评估模型的间隔(#迭代)')
+    parser.add_argument('--print_log', type=str2bool, default=True, help='是否打印日志')
+    
+    # 其他参数
+    parser.add_argument('--num_worker', type=int, default=0, help='数据加载器的工作进程数')
+    parser.add_argument('--train_feeder_args', default=dict(), help='训练数据加载器参数')
+    parser.add_argument('--test_feeder_args', default=dict(), help='测试数据加载器参数')
+    parser.add_argument('--device', type=int, default=0, nargs='+', help='用于训练或测试的GPU索引 (DDP模式下此参数会被忽略)')
+    parser.add_argument('--start_epoch', type=int, default=0, help='从哪个轮次开始训练')
+    parser.add_argument('--gumble_tau', type=float, default=1, help='gumble_softmax的温度参数')
     return parser
 
-
 class Processor:
-    def __init__(self, arg):
+    """
+    因果图神经网络训练处理器
+    """
+    # [修正] __init__ 方法的修改
+    def __init__(self, rank, world_size, arg):
+        """初始化处理器，设置配置、加载数据和模型"""
+        self.rank = rank
+        self.world_size = world_size
         self.arg = arg
+        
+        # [修正] 让所有进程都调用save_arg()来设置必要的属性
         self.save_arg()
+        
+        # 只有主进程写完文件后，其他进程再继续
+        dist.barrier()
+        
+        self.lambda_l1 = getattr(arg, 'lambda_l1', 0.0001)
+        self.load_precomputed_graph()
         self.load_data()
-        self.train_writer = SummaryWriter(os.path.join(self.work_dir, 'train'), 'train')
-        self.val_writer = SummaryWriter(os.path.join(self.work_dir, 'train_val'), 'train_val')
-        self.test_writer = SummaryWriter(os.path.join(self.work_dir, 'test'), 'test')
+
+        if self.rank == 0:
+            self.train_writer = SummaryWriter(os.path.join(self.work_dir, 'train'), 'train')
+            self.val_writer = SummaryWriter(os.path.join(self.work_dir, 'val'), 'val')
+            self.test_writer = SummaryWriter(os.path.join(self.work_dir, 'test'), 'test')
+
         self.global_step = 0
+        self.best_acc = 0
+        self.best_val_acc = 0
+        self.best_model_state = None
+        self.best_mask_state = None
+        self.best_masks = None
+        self.best_epoch = -1
+        self.epoch_mask_sums = {}
+        self.best_epoch_pretrain = -1
+        self.best_epoch_stage1 = -1
+        self.best_epoch_stage2 = -1
         self.load_model()
         self.load_optimizer()
-        self.best_acc = 0
 
+    # [修正] save_arg 方法的修改
     def save_arg(self):
+        """保存配置参数并创建工作目录"""
+        # 这部分是变量设置，所有进程都需要执行
         self.num_class = int(self.arg.data_name.split('_')[1])
-
-        self.reg = coef_list(init=0.01, final=1, pre_epoch=self.arg.pre_epoch,
-                             inc_epoch=self.arg.num_epoch, num_epoch=self.arg.num_epoch, kind=self.arg.inc_mode)
-
+        self.reg = coef_list(
+            init=0.01, final=1, pre_epoch=self.arg.pre_epoch,
+            inc_epoch=self.arg.num_epoch, num_epoch=self.arg.num_epoch, kind=self.arg.inc_mode
+        )
         self.arg.graph_args = str2list(self.arg.graph_args, flag='simple')
         self.arg.model_args = str2list(self.arg.model_args, flag='deep')
-        self.data_path = os.path.join(self.arg.data_dir, self.arg.data_name.split('_pw')[0], self.arg.data_name)
+        self.data_path = os.path.join(
+            self.arg.data_dir, self.arg.data_name.split('_pw')[0], self.arg.data_name
+        )
         self.graph_name = get_graph_name(**self.arg.graph_args)
+        
         netw = 'C{}k{}G{}'.format(
             '.'.join([str(s) for s in self.arg.model_args['hidden1']]),
             '.'.join([str(s) for s in self.arg.model_args['kernels']]),
             '.'.join([str(s) for s in self.arg.model_args['hidden2']]),
         )
-        losses = 'lr{:g}m{:g}_{:d}.{:d}{}_O{:g}R{:g}G{:g}S0'.format(
-            self.arg.base_lr, self.arg.base_lr_mask,
-            self.arg.pre_epoch, self.arg.num_epoch, self.arg.inc_mode,
-            self.arg.LO, self.arg.LR, self.arg.LG)
+        losses = 'lr{:g}m{:g}_{:d}.{:d}{}_C{:g}O{:g}CI{:g}S0'.format(
+            self.arg.base_lr, self.arg.base_lr_mask, self.arg.pre_epoch, 
+            self.arg.num_epoch, self.arg.inc_mode, self.arg.LC, self.arg.LO, self.arg.LCI
+        )
+        
         self.arg.exp_name = '__'.join([losses, self.arg.exp_name])
-
         self.model_name = 't{}__{}'.format(time.strftime('%Y%m%d%H%M%S'), self.arg.exp_name)
-        self.work_dir = os.path.join(self.arg.save_dir, self.arg.data_name, f'split{self.arg.split_seed}',
-                                     f'seed{self.arg.seed}', f'fold{self.arg.fold}', self.model_name)
-        os.makedirs(self.work_dir, exist_ok=True)
-        os.makedirs(os.path.join(self.work_dir, 'epoch'), exist_ok=True)  # save pt, pkl
-        self.output_device = self.arg.device[0] if type(self.arg.device) is list else self.arg.device
-        self.print_log(',\t'.join([self.graph_name, netw, self.arg.exp_name]))
+        
+        self.work_dir = os.path.join(
+            self.arg.save_dir, 
+            f'fold{self.arg.fold}'
+        )
+        self.output_device = self.rank
 
-        # copy all files
-        pwd = os.path.dirname(os.path.realpath(__file__))
-        copytree(pwd, os.path.join(self.work_dir, 'code'), symlinks=False, ignore=ignore_patterns('__pycache__'), dirs_exist_ok=True)
-        arg_dict = vars(self.arg)
-        with open(os.path.join(self.work_dir, 'config.yaml'), 'w') as f:
-            yaml.dump(arg_dict, f)
+        # [修正] 这部分是文件IO操作，只有主进程(rank=0)执行
+        if self.rank == 0:
+            os.makedirs(self.work_dir, exist_ok=True)
+            os.makedirs(os.path.join(self.work_dir, 'epoch'), exist_ok=True)
+            os.makedirs(os.path.join(self.work_dir, 'best_models'), exist_ok=True)
+            
+            self.print_log(',\t'.join([self.graph_name, netw, self.arg.exp_name]))
+
+            arg_dict = vars(self.arg)
+            with open(os.path.join(self.work_dir, 'config.yaml'), 'w') as f:
+                yaml.dump(arg_dict, f)
+
+    # 将此函数添加到您的 Processor 类中
+    def load_precomputed_graph(self):
+        """
+        加载预先计算好的一致性边/图邻接矩阵。
+        这是一个简洁、高效的最终方案。
+        """
+        # 1. 构建预计算文件的完整路径
+        #    文件名需要与您在Jupyter中生成的文件名一致。
+        graph_file_name = 'group_correlation_edges.npy'
+        print(f"正在加载预计算的图: ")
+        graph_path = os.path.join(self.data_path, graph_file_name)
+        
+        # 2. 检查文件是否存在，如果不存在则报错
+        if not os.path.exists(graph_path):
+            error_msg = (
+                f"错误: 找不到预计算的图文件 '{graph_path}'。\n"
+                f"请确保您已经成功运行了离线的图构建脚本，"
+                f"并将生成的 '{graph_file_name}' 文件放置在正确的数据目录中: '{self.data_path}'"
+            )
+            self.print_log(error_msg, log_type="error")
+            raise FileNotFoundError(error_msg)
+
+        # 3. 加载文件并直接赋值给类属性 self.consistent_edges_mask
+        #    这个属性将在后续的 load_data 方法中被 Feeder 使用
+        print('卡在这里了')
+        self.consistent_edges_mask = np.load(graph_path)
+        # 4. 打印日志以确认加载成功
+        num_edges = np.sum(self.consistent_edges_mask)
+        self.print_log(
+            f"预计算图加载成功。 形状: {self.consistent_edges_mask.shape}, "
+            f"包含 {int(num_edges)} 条边。",
+            log_type="info"
+        )
 
     def load_data(self):
-        self.print_log('Load data.')
+        """加载训练、验证和测试数据，应用一致性边掩码"""
+        self.print_log('正在加载数据集(包含独立验证集)...')
         Feeder = import_class(self.arg.feeder)
-        train_set = Feeder(fold=self.arg.fold, split_seed=self.arg.split_seed,
-                           out_dir=self.data_path, mode='train', graph_arg=self.arg.graph_args, **self.arg.train_feeder_args)
-        test_set = Feeder(fold=self.arg.fold, split_seed=self.arg.split_seed,
-                          out_dir=self.data_path, mode='test', graph_arg=self.arg.graph_args, **self.arg.test_feeder_args)
-        self.DiffNode = Prior(train_set, device=self.output_device)
-        self.print_log('prior knowledge sparsity:\nNode: {}/{:d}={:.4f}'.format(
-            self.DiffNode.sum(), self.DiffNode.shape[0], self.DiffNode.sum() / self.DiffNode.shape[0],
-        ))
+        val_ratio = 0.2
+
+        train_set = Feeder(
+            fold=self.arg.fold, split_seed=self.arg.split_seed, out_dir=self.data_path, 
+            mode='train', graph_arg=self.arg.graph_args, **self.arg.train_feeder_args,
+            build_large_graph=True, consistent_mask=self.consistent_edges_mask, val_ratio=val_ratio
+        )
+        val_set = Feeder(
+            fold=self.arg.fold, split_seed=self.arg.split_seed, out_dir=self.data_path, 
+            mode='val', graph_arg=self.arg.graph_args, **self.arg.test_feeder_args,
+            build_large_graph=False, consistent_mask=self.consistent_edges_mask, val_ratio=val_ratio
+        )
+        test_set = Feeder(
+            fold=self.arg.fold, split_seed=self.arg.split_seed, out_dir=self.data_path, 
+            mode='test', graph_arg=self.arg.graph_args, **self.arg.test_feeder_args,
+            build_large_graph=False, consistent_mask=self.consistent_edges_mask, val_ratio=val_ratio
+        )
+        
+        self.DiffNode = Prior(train_set, device=self.rank)
+        prior_sparsity = self.DiffNode.sum() / self.DiffNode.shape[0]
+        self.print_log(f'先验知识稀疏度: 节点 {self.DiffNode.sum()}/{self.DiffNode.shape[0]}={prior_sparsity:.4f}')
 
         self.data_loader = dict()
-        # train_sampler = WeightedRandomSampler(weights=train_set.samples_weights, num_samples=len(train_set))
-        # self.data_loader['train'] = DataLoader(
-        #     dataset=train_set, batch_size=self.arg.batch_size, num_workers=self.arg.num_worker,
-        #     shuffle=False, drop_last=True, sampler=train_sampler)
+
+        train_sampler = DistributedSampler(train_set, num_replicas=self.world_size, rank=self.rank, shuffle=True)
+        per_gpu_batch_size = self.arg.batch_size // self.world_size
+        self.print_log(f"总批次大小: {self.arg.batch_size}, GPU数量: {self.world_size}, 每GPU批次大小: {per_gpu_batch_size}", log_type="info")
+
         self.data_loader['train'] = DataLoader(
-            dataset=train_set, batch_size=self.arg.batch_size, num_workers=self.arg.num_worker,
-            shuffle=True, drop_last=True)
-        self.data_loader['train_val'] = DataLoader(
-            dataset=train_set, batch_size=self.arg.batch_size, num_workers=self.arg.num_worker,
-            shuffle=False, drop_last=False)
+            dataset=train_set, batch_size=per_gpu_batch_size, sampler=train_sampler,
+            num_workers=self.arg.num_worker, drop_last=True, pin_memory=True
+        )
+        self.data_loader['val'] = DataLoader(
+            dataset=val_set, batch_size=self.arg.test_batch_size, num_workers=self.arg.num_worker,
+            shuffle=False, drop_last=False
+        )
         self.data_loader['test'] = DataLoader(
             dataset=test_set, batch_size=self.arg.test_batch_size, num_workers=self.arg.num_worker,
-            shuffle=False, drop_last=False)
+            shuffle=False, drop_last=False
+        )
+        self.print_log(f"数据加载完成: 训练集 {len(train_set)} 样本, 验证集 {len(val_set)} 样本, 测试集 {len(test_set)} 样本")
 
     def load_model(self):
-        self.loss = nn.CrossEntropyLoss(reduction="mean")
-        self.losses = nn.CrossEntropyLoss(reduction="none")
-        self.mask = import_class(self.arg.model).CausalMask(
-            patch_num=self.data_loader['train'].dataset.P, channel=self.arg.model_args['hidden1'][-1],
-        ).cuda(self.output_device)
-        self.model = import_class(self.arg.model).CausalNet(
-            num_class=self.num_class, **self.arg.model_args
-        ).cuda(self.output_device)
+        """加载损失函数和模型"""
+        self.loss = nn.CrossEntropyLoss(reduction="mean").to(self.rank)
+        self.losses = nn.CrossEntropyLoss(reduction="none").to(self.rank)
+        
+        base_mask_model = import_class(self.arg.model).CausalMask(
+            patch_num=self.data_loader['train'].dataset.P, 
+            channel=self.arg.model_args['hidden1'][-1],
+            consistent_edges=self.consistent_edges_mask, tau=self.arg.gumble_tau
+        ).to(self.rank)
+
+        pretrained_path = getattr(self.arg, 'pretrained_path', None)
+        freeze_extractor = getattr(self.arg, 'freeze_extractor', True)
+        if pretrained_path is None and 'pretrained_path' in self.arg.model_args:
+            pretrained_path = self.arg.model_args['pretrained_path']
+        if 'freeze_extractor' in self.arg.model_args:
+            freeze_extractor = self.arg.model_args['freeze_extractor']
+
+        model_kwargs = {
+            'num_class': self.num_class, **self.arg.model_args,
+            'pretrained_path': pretrained_path, 'freeze_extractor': freeze_extractor
+        }
+        
+        base_causal_model = import_class(self.arg.model).CausalNet(**model_kwargs).to(self.rank)
+        
+        self.mask = DDP(base_mask_model, device_ids=[self.rank], find_unused_parameters=True)
+        self.model = DDP(base_causal_model, device_ids=[self.rank], find_unused_parameters=True)
 
     def load_optimizer(self):
+        """初始化优化器和学习率调度器"""
         if self.arg.optimizer == 'SGD':
-            self.optimizer_mask = optim.SGD(self.mask.parameters(),
-                                            lr=self.arg.base_lr_mask, weight_decay=self.arg.weight_decay,
-                                            momentum=0.9, nesterov=self.arg.nesterov)
-            self.optimizer = optim.SGD(self.model.parameters(),
-                                       lr=self.arg.base_lr, weight_decay=self.arg.weight_decay,
-                                       momentum=0.9, nesterov=self.arg.nesterov)
+            self.optimizer_mask = optim.SGD(
+                self.mask.parameters(), lr=self.arg.base_lr_mask, 
+                weight_decay=self.arg.weight_decay, momentum=0.9, nesterov=self.arg.nesterov
+            )
+            self.optimizer = optim.SGD(
+                self.model.parameters(), lr=self.arg.base_lr, 
+                weight_decay=self.arg.weight_decay, momentum=0.9, nesterov=self.arg.nesterov
+            )
         elif self.arg.optimizer == 'Adam':
-            self.optimizer_mask = optim.Adam(self.mask.parameters(),
-                                             lr=self.arg.base_lr_mask, weight_decay=self.arg.weight_decay)
-            self.optimizer = optim.Adam(self.model.parameters(),
-                                        lr=self.arg.base_lr, weight_decay=self.arg.weight_decay)
+            self.optimizer_mask = optim.Adam(
+                self.mask.parameters(), lr=self.arg.base_lr_mask, weight_decay=self.arg.weight_decay
+            )
+            self.optimizer = optim.Adam(
+                self.model.parameters(), lr=self.arg.base_lr, weight_decay=self.arg.weight_decay
+            )
         else:
-            raise ValueError()
+            raise ValueError(f"不支持的优化器类型: {self.arg.optimizer}")
 
+        # ReduceLROnPlateau的verbose只在主进程上显示
+        verbose_flag = self.rank == 0
         if self.arg.scheduler == 'auto':
-            self.lr_scheduler = ReduceLROnPlateau(self.optimizer, verbose=True,
-                                                  patience=self.arg.stepsize, factor=self.arg.gamma)
-            self.lr_scheduler_mask = ReduceLROnPlateau(self.optimizer_mask, verbose=True,
-                                                       patience=self.arg.stepsize, factor=self.arg.gamma)
+            self.lr_scheduler = ReduceLROnPlateau(
+                self.optimizer, verbose=verbose_flag, patience=self.arg.stepsize, factor=self.arg.gamma
+            )
+            self.lr_scheduler_mask = ReduceLROnPlateau(
+                self.optimizer_mask, verbose=verbose_flag, patience=self.arg.stepsize, factor=self.arg.gamma
+            )
         elif self.arg.scheduler == 'step':
             self.lr_scheduler = StepLR(self.optimizer, step_size=self.arg.stepsize, gamma=self.arg.gamma)
             self.lr_scheduler_mask = StepLR(self.optimizer_mask, step_size=self.arg.stepsize, gamma=self.arg.gamma)
         else:
-            raise ValueError()
+            raise ValueError(f"不支持的学习率调度器类型: {self.arg.scheduler}")
 
     def start(self):
+        """开始训练流程，包括预训练和主训练阶段"""
+        if self.rank == 0: self.epoch_results = {}
+        
+        # ====================== 预训练阶段 ======================
         for epoch in range(self.arg.start_epoch, self.arg.pre_epoch):
-            # save_model = ((epoch + 1) % self.arg.save_interval == 0) or (epoch + 1 == self.arg.num_epoch)
-            save_model = False
-            self.train_emb(epoch, save_model=save_model)
+            self.data_loader['train'].sampler.set_epoch(epoch)
+            if self.rank == 0: self.epoch_results[epoch] = {'train': {}, 'val': {}, 'test': {}}
+            self.train_emb(epoch)
+            if self.rank == 0:
+                with torch.no_grad():
+                    self.eval_emb(epoch, save_score=self.arg.save_score, loader_name=['val'])
+                    self.eval_emb(epoch, save_score=self.arg.save_score, loader_name=['test'])
+                self.print_epoch_summary(epoch, is_pre_train=True)
+        
+        dist.barrier()
+        
+        if self.rank == 0:
+            # [修改] 记录本阶段的最佳轮次
+            self.best_epoch_pretrain = self.best_epoch
+            self.print_log("预训练阶段结束，同步模型状态...", log_type="info")
+            self.save_best_model(stage='pretrain')
+            if self.best_model_state: self.model.module.load_state_dict(self.best_model_state)
+            
             with torch.no_grad():
-                self.eval_emb(epoch, save_score=self.arg.save_score, loader_name=['train_val', 'test'])
+                test_acc = 0.0
+                if self.best_epoch != -1:
+                    # 使用 self.best_epoch_pretrain 来获取正确的测试结果
+                    test_acc = self.epoch_results[self.best_epoch_pretrain]['test']['acc_official']
+                self.print_log(f"预训练阶段完成: 最佳模型轮次 {self.best_epoch_pretrain+1}, 验证准确率 {self.best_val_acc:.4f}, 测试准确率 {test_acc:.4f}", log_type="result")
+            torch.save(self.model.module.state_dict(), os.path.join(self.work_dir, 'tmp_pretrain_model.pt'))
 
-        for epoch in range(self.arg.pre_epoch, self.arg.num_epoch):
-            # save_model = ((epoch + 1) % self.arg.save_interval == 0) or (epoch + 1 == self.arg.num_epoch)
-            save_model = False
-            self.train(epoch, save_model=save_model)
+        dist.barrier()
+        self.model.module.load_state_dict(torch.load(os.path.join(self.work_dir, 'tmp_pretrain_model.pt'), map_location=f'cuda:{self.rank}'))
+        
+        # [修改] 重置计数器，为下一阶段做准备
+        if self.rank == 0: self.best_val_acc = 0; self.best_epoch = -1
+        
+        # ====================== 第一阶段训练 ======================
+        for epoch in range(self.arg.pre_epoch, self.arg.stage_transition_epoch):
+            self.data_loader['train'].sampler.set_epoch(epoch)
+            if self.rank == 0: self.epoch_results[epoch] = {'train': {}, 'val': {}, 'test': {}}
+            self.train(epoch)
+            if self.rank == 0:
+                with torch.no_grad():
+                    self.eval(epoch, save_score=self.arg.save_score, loader_name=['val'])
+                    self.eval(epoch, save_score=self.arg.save_score, loader_name=['test'])
+                self.print_epoch_summary(epoch, is_pre_train=False)
+
+        dist.barrier()
+        
+        if self.rank == 0:
+            # [修改] 记录本阶段的最佳轮次
+            self.best_epoch_stage1 = self.best_epoch
+            self.print_log("第一阶段结束，同步模型状态...", log_type="info")
+            self.save_best_model(stage='stage1')
+            if self.best_model_state: self.model.module.load_state_dict(self.best_model_state)
+            if self.best_mask_state: self.mask.module.load_state_dict(self.best_mask_state)
+
             with torch.no_grad():
-                self.eval(epoch, save_score=self.arg.save_score, loader_name=['train_val', 'test'])
+                test_acc = 0.0
+                if self.best_epoch != -1:
+                    test_acc = self.epoch_results[self.best_epoch_stage1]['test']['acc_official']
+                self.print_log(f"第一阶段完成: 最佳模型轮次 {self.best_epoch_stage1+1}, 验证准确率 {self.best_val_acc:.4f}, 测试准确率 {test_acc:.4f}", log_type="result")
+            torch.save(self.model.module.state_dict(), os.path.join(self.work_dir, 'tmp_stage1_model.pt'))
+            torch.save(self.mask.module.state_dict(), os.path.join(self.work_dir, 'tmp_stage1_mask.pt'))
 
-        self.print_log(f'best acc: {self.best_acc}, model_name: {self.model_name}')
+        dist.barrier()
+        self.model.module.load_state_dict(torch.load(os.path.join(self.work_dir, 'tmp_stage1_model.pt'), map_location=f'cuda:{self.rank}'))
+        self.mask.module.load_state_dict(torch.load(os.path.join(self.work_dir, 'tmp_stage1_mask.pt'), map_location=f'cuda:{self.rank}'))
 
-        # settle results
-        ss = SettleResults(self.data_loader['test'].dataset.out_dir, self.work_dir, self.arg.exp_name)
-        ss.concat_trend_scores(num_epoch=self.arg.num_epoch, start_epoch=0,
-                               metrics=['acc', 'pre', 'sen', 'spe', 'f1'], phase='test', ave='micro')
-        ss.merge_pkl(num_epoch=self.arg.num_epoch, start_epoch=0,
-                     type_list=['test_score', 'train_val_score'])
-        ss.confusion_matrix(out_path=os.path.join(self.work_dir, 'CM.png'))
-        self.print_log(f'finish: {self.work_dir}')
+        # [修改] 重置计数器，为下一阶段做准备
+        if self.rank == 0: self.best_val_acc = 0; self.best_epoch = -1
+        
+        # ====================== 第二阶段训练 ======================
+        for epoch in range(self.arg.stage_transition_epoch, self.arg.num_epoch):
+            self.data_loader['train'].sampler.set_epoch(epoch)
+            if self.rank == 0: self.epoch_results[epoch] = {'train': {}, 'val': {}, 'test': {}}
+            self.train(epoch)
+            if self.rank == 0:
+                with torch.no_grad():
+                    self.eval(epoch, save_score=self.arg.save_score, loader_name=['val'])
+                    self.eval(epoch, save_score=self.arg.save_score, loader_name=['test'])
+                self.print_epoch_summary(epoch, is_pre_train=False)
+        
+        dist.barrier()
 
+        # ====================== 最终评估和清理 ======================
+        if self.rank == 0:
+            # [修改] 记录本阶段的最佳轮次
+            self.best_epoch_stage2 = self.best_epoch
+            self.print_log("第二阶段结束，进行最终评估...", log_type="info")
+            self.save_best_model(stage='stage2')
+            if self.best_model_state: self.model.module.load_state_dict(self.best_model_state)
+            if self.best_mask_state: self.mask.module.load_state_dict(self.best_mask_state)
+
+            with torch.no_grad():
+                test_acc = 0.0
+                if self.best_epoch != -1:
+                    test_acc = self.epoch_results[self.best_epoch_stage2]['test']['acc_official']
+                self.best_acc = test_acc
+            
+            # [修改] 在最终评估前，调用最终总结报告
+            self._print_final_summary()
+            
+            # 结果处理和混淆矩阵
+            try:
+                ss = SettleResults(self.data_loader['test'].dataset.out_dir, self.work_dir, self.arg.exp_name)
+                best_score_file = os.path.join(self.work_dir, 'best_models', 'best_stage2_test_score.pkl')
+                if os.path.exists(best_score_file):
+                    with open(best_score_file, 'rb') as f: test_scores = pickle.load(f)
+                    with open(os.path.join(self.data_loader['test'].dataset.out_dir, 'label.pkl'), 'rb') as f: label_all, sub_name_all = pickle.load(f)
+                    label_dict = dict(zip(sub_name_all, label_all))
+                    score_df = pd.DataFrame(test_scores)
+                    label_df = pd.DataFrame(label_dict, index=['true_label'])
+                    scores = pd.concat([score_df, label_df], axis=0).dropna(axis=1)
+                    from tools.utils import get_CM, plot_confusion_matrix
+                    cm = get_CM(scores.iloc[-1, :], scores.iloc[:-1, :])
+                    classes = ['0', 'n0'] if self.data_loader['test'].dataset.num_class == 2 else [str(kk) for kk in range(self.data_loader['test'].dataset.num_class)]
+                    plot_confusion_matrix(
+                        self.data_loader['test'].dataset.data_name + '\n' + self.arg.exp_name,
+                        os.path.join(self.work_dir, 'CM.png'), cm=cm, classes=classes
+                    )
+            except Exception as e:
+                self.print_log(f"警告: 最终结果处理失败: {str(e)}", log_type="info")
+
+            # 清理临时文件
+            if os.path.exists(os.path.join(self.work_dir, 'tmp_pretrain_model.pt')): os.remove(os.path.join(self.work_dir, 'tmp_pretrain_model.pt'))
+            if os.path.exists(os.path.join(self.work_dir, 'tmp_stage1_model.pt')): os.remove(os.path.join(self.work_dir, 'tmp_stage1_model.pt'))
+            if os.path.exists(os.path.join(self.work_dir, 'tmp_stage1_mask.pt')): os.remove(os.path.join(self.work_dir, 'tmp_stage1_mask.pt'))
+            
+            self.print_log(f'训练完成: {self.work_dir}', log_type="info")
+
+    def print_epoch_summary(self, epoch, is_pre_train=False):
+        """
+        [最终完美版]
+        打印内容详尽、格式优美的轮次总结。
+        - 清晰区分 预训练/第一阶段/第二阶段。
+        - 详细列出 验证/测试集 的官方评估指标。
+        - 分别展示 掩码(Mask)和GNN 的训练详情，包含所有子损失和对应的准确率。
+        - 汇总展示 学习率、正则化强度 和 掩码统计等关键参数。
+        """
+        # 确保只有主进程(rank 0)执行打印
+        if self.rank != 0: 
+            return
+
+        is_first_stage = epoch < self.arg.stage_transition_epoch
+        stage_name = "预训练" if is_pre_train else ("第一阶段" if is_first_stage else "第二阶段")
+        results = self.epoch_results[epoch]
+
+        # 打印总标题
+        self.print_log("="*120, print_time=False)
+        self.print_log(f"轮次 {epoch + 1}/{self.arg.num_epoch} ({stage_name}) 总结", log_type="summary")
+        self.print_log("-"*120, print_time=False)
+
+        # 场景一：预训练阶段的打印
+        if is_pre_train:
+            header = f"{'指标':<15} | {'训练':<25} | {'验证':<25} | {'测试':<25}"
+            self.print_log(header, print_time=False)
+            self.print_log("-"*120, print_time=False)
+
+            # 准备数据
+            train_res = results.get('train', {})
+            val_res = results.get('val', {})
+            test_res = results.get('test', {})
+            
+            # 官方准确率
+            val_acc_str = f"\033[1m\033[33m{val_res.get('acc_official', 0.0):.4f}※\033[0m" if val_res.get('acc_official', 0.0) == self.best_val_acc and self.best_val_acc > 0 else f"{val_res.get('acc_official', 0.0):.4f}"
+            acc_row = f"{'官方准确率':<14} | {train_res.get('acc_invariance', 0.0):<25.4f} | {val_acc_str:<35} | {test_res.get('acc_official', 0.0):<25.4f}"
+            self.print_log(acc_row, print_time=False)
+            
+            # AUC
+            auc_row = f"{'AUC':<14} | {train_res.get('auc', 0.0):<25.4f} | {val_res.get('auc', 0.0):<25.4f} | {test_res.get('auc', 0.0):<25.4f}"
+            self.print_log(auc_row, print_time=False)
+            
+            # 总损失
+            loss_row = f"{'总损失':<14} | \033[31m{train_res.get('loss_all', 0.0):.4f}\033[0m{'':<19} | \033[31m{val_res.get('loss_all', 0.0):.4f}\033[0m{'':<19} | \033[31m{test_res.get('loss_all', 0.0):.4f}\033[0m{'':<19}"
+            self.print_log(loss_row, print_time=False)
+
+            # 学习率
+            lr_gnn = self.optimizer.param_groups[0]['lr']
+            lr_row = f"{'学习率':<14} | GNN: {lr_gnn:<20.6f} | {'-':<25} | {'-':<25}"
+            self.print_log(lr_row, print_time=False)
+            
+        # 场景二：主训练阶段的打印
+        else:
+            # 1. 官方评估结果
+            self.print_log("【官方评估结果】", print_time=False)
+            val_res = results.get('val', {})
+            test_res = results.get('test', {})
+            val_acc_str = f"\033[1m\033[33m{val_res.get('acc_official', 0.0):.4f}※\033[0m" if val_res.get('acc_official', 0.0) == self.best_val_acc and self.best_val_acc > 0 else f"{val_res.get('acc_official', 0.0):.4f}"
+            official_row_val = f"  验证集: 准确率={val_acc_str} | AUC={val_res.get('auc', 0.0):.4f}"
+            official_row_test = f"  测试集: 准确率={test_res.get('acc_official', 0.0):.4f} | AUC={test_res.get('auc', 0.0):.4f}"
+            self.print_log(official_row_val, print_time=False)
+            self.print_log(official_row_test, print_time=False)
+            self.print_log("-"*120, print_time=False)
+
+            # 准备训练数据
+            train_res = results.get('train', {})
+            mask_res = train_res.get('mask', {})
+            gnn_res = train_res.get('gnn', {})
+
+            # 2. 掩码训练详情
+            self.print_log("【掩码训练详情】", print_time=False)
+            self.print_log(f"  总损失: \033[31m{mask_res.get('loss_all', 0):.4f}\033[0m", print_time=False)
+            
+            # 根据不同阶段打印不同子损失
+            if is_first_stage:
+                self.print_log(f"    ├─ 不变性损失 (Lci): {mask_res.get('loss_invariance', 0):.4f} (Acc: \033[32m{mask_res.get('acc_invariance', 0):.2%}\033[0m)")
+                self.print_log(f"    ├─ 变异性损失 (Lcv): {mask_res.get('loss_variability', 0):.4f} (Acc: \033[32m{mask_res.get('acc_variability', 0):.2%}\033[0m)")
+                self.print_log(f"    ├─ 引导损失 (Lg):    {mask_res.get('loss_guide', 0):.4f}")
+                self.print_log(f"    └─ 稀疏性损失:        {mask_res.get('loss_sparsity_reg', 0):.4f}")
+            else: # 第二阶段
+                self.print_log(f"    ├─ 不变性损失 (Lci): {mask_res.get('loss_invariance', 0):.4f} (Acc: \033[32m{mask_res.get('acc_invariance', 0):.2%}\033[0m)")
+                self.print_log(f"    ├─ 因果损失 (Lc):    {mask_res.get('loss_causal', 0):.4f} (Acc: \033[32m{mask_res.get('acc_causal', 0):.2%}\033[0m)")
+                self.print_log(f"    ├─ 反事实损失 (Lo):  {mask_res.get('loss_counterfactual', 0):.4f} (Acc: \033[32m{mask_res.get('acc_counterfactual', 0):.2%}\033[0m)")
+                self.print_log(f"    └─ 稀疏性损失:        {mask_res.get('loss_sparsity_reg', 0):.4f}")
+
+            # 3. GNN训练详情
+            self.print_log("【GNN训练详情】", print_time=False)
+            self.print_log(f"  总损失: \033[31m{gnn_res.get('loss_all', 0):.4f}\033[0m", print_time=False)
+            self.print_log(f"    ├─ L1正则化损失:      {gnn_res.get('loss_l1_reg', 0):.4f}")
+            if is_first_stage:
+                self.print_log(f"    └─ 不变性损失 (Lci): {gnn_res.get('loss_invariance', 0):.4f} (Acc: \033[32m{gnn_res.get('acc_invariance', 0):.2%}\033[0m)")
+            else: # 第二阶段
+                self.print_log(f"    ├─ 不变性损失 (Lci): {gnn_res.get('loss_invariance', 0):.4f} (Acc: \033[32m{gnn_res.get('acc_invariance', 0):.2%}\033[0m)")
+                self.print_log(f"    └─ 因果损失 (Lc):    {gnn_res.get('loss_causal', 0):.4f} (Acc: \033[32m{gnn_res.get('acc_causal', 0):.2%}\033[0m)")
+
+            # 4. 训练参数与状态
+            self.print_log("【训练参数与状态】", print_time=False)
+            lr_gnn = self.optimizer.param_groups[0]['lr']
+            lr_mask = self.optimizer_mask.param_groups[0]['lr']
+            lambda_reg = 0.05 * (1 + epoch / self.arg.num_epoch)
+            self.print_log(f"  学习率: GNN={lr_gnn:.6f} | Mask={lr_mask:.6f} || 稀疏正则强度 λ_reg={lambda_reg:.4f}", print_time=False)
+
+            if hasattr(self, 'current_mask_sums'):
+                node_sum = self.current_mask_sums.get('node', 0)
+                edge_sum = self.current_mask_sums.get('edge', 0)
+                total_nodes = self.mask.module.P
+                total_edges = torch.sum(self.mask.module.learnable_mask).item()
+                node_percentage = node_sum / total_nodes * 100 if total_nodes > 0 else 0
+                edge_percentage = edge_sum / total_edges * 100 if total_edges > 0 else 0
+                mask_row = f"  因果掩码和: 节点={int(node_sum)}/{total_nodes} ({node_percentage:.1f}%) | 边={int(edge_sum)}/{int(total_edges)} ({edge_percentage:.1f}%)"
+                self.print_log(mask_row, print_time=False)
+
+        self.print_log("="*120, print_time=False)
+
+    
     def train_emb(self, epoch, save_model=False):
         self.model.train()
-        self.print_log('Training epoch: {}'.format(epoch + 1))
+        self.print_log(f'预训练轮次: {epoch + 1}')
         loader = self.data_loader['train']
-        self.train_writer.add_scalar(self.model_name + '/epoch', epoch, self.global_step)
-        self.record_time()
-        timer = dict(dataloader=0.001, model=0.001, statistics=0.001)
-        try:
-            process = tqdm(loader, ncols=50)
-        except KeyboardInterrupt:
-            process.close()
-            raise
-        process.close()
+        
+        if self.rank == 0:
+            self.train_writer.add_scalar(self.model_name + '/epoch', epoch, self.global_step)
+            self.record_time()
 
-        loss_value = []
-        scores, true = [], []
-        self.print_log('\tReg coefficient: {:.4f}.'.format(self.reg[epoch]))
-        for batch_idx, (data, edges, label, index) in enumerate(process):
+        loss_value, all_accuracies, l1_losses = [], [], []
+
+        for batch_idx, (data, edges, label, index) in enumerate(loader):
             self.global_step += 1
-
             x_node, edge, label = self.converse2tensor(data, edges, label)
-            timer['dataloader'] += self.split_time()
-
-            x_new = self.model.emb(x_node)
-            yw = self.model.prediction_whole(x_new, edge)
-            lossC = self.losses(yw, label)
-            lossAll = lossC.mean()
+            #x_new = self.model.module.emb(x_node)
+            yw = self.model.module.prediction_whole(x_node, edge, is_large_graph=True)
+            lossW = self.losses(yw, label)
+            l1_loss = self.compute_l1_regularization(self.model.module)
+            loss_all = lossW.mean() + l1_loss
+            
             self.optimizer.zero_grad()
-            lossAll.backward()
+            loss_all.backward()
             self.optimizer.step()
 
-            loss_value.append(lossC.mean().item())
-            timer['model'] += self.split_time()
+            if self.rank == 0:
+                loss_value.append(lossW.mean().item())
+                l1_losses.append(l1_loss.item())
+                _, predict_label = torch.max(yw.data, 1)
+                acc = torch.mean((predict_label == label.data).float())
+                all_accuracies.append(acc.item())
+                self.train_writer.add_scalar(self.model_name + '/acc', acc.item(), self.global_step)
+                self.train_writer.add_scalar(self.model_name + '/loss_w', lossW.mean().item(), self.global_step)
+                self.train_writer.add_scalar(self.model_name + '/l1_loss', l1_loss.item(), self.global_step)
+                self.train_writer.add_scalar(self.model_name + '/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
 
-            true.extend(self.data_loader['train'].dataset.label[index])
-            scores.extend(yw.view(-1).data.cpu().numpy())
+        if self.rank == 0:
+            self.print_log(f'\t预训练平均损失: {np.mean(loss_value):.4f}, L1损失: {np.mean(l1_losses):.4f}')
+            train_results = {'loss_all': np.mean(loss_value), 'loss_l1': np.mean(l1_losses), 'acc_invariance': np.mean(all_accuracies)}
+            self.epoch_results[epoch]['train'] = train_results
+            if save_model: torch.save(self.model.module.state_dict(), os.path.join(self.work_dir, 'epoch', f'epoch-{epoch + 1}.pt'))
 
-            value, predict_label = torch.max(yw.data, 1)
-            acc = torch.mean((predict_label == label.data).float())
-            self.train_writer.add_scalar(self.model_name + '/acc', acc.item(), self.global_step)
-            self.train_writer.add_scalar(self.model_name + '/loss_causal', lossC.mean().item(), self.global_step)
-            self.train_writer.add_scalar(self.model_name + '/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
-            timer['statistics'] += self.split_time()
-
-        # statistics of time consumption and loss
-        proportion = {
-            k: '{:02d}%'.format(int(round(v * 100 / sum(timer.values()))))
-            for k, v in timer.items()
-        }
-        self.print_log('\tMean training loss: {:.4f}.'.format(np.mean(loss_value)))
-        self.print_log('\tTime consumption: [Data]{dataloader}, [Network]{model}, [Evaluate]{statistics}'.format(**proportion))
-
-        if save_model:
-            state_dict = self.model.state_dict()
-            torch.save(state_dict, os.path.join(self.work_dir, 'epoch', 'epoch-' + str(epoch + 1) + '.pt'))
-
-    def eval_emb(self, epoch, save_score=False, loader_name=['test']):
+    def eval_emb(self, epoch, save_score=False, loader_name=['val']):
+        if self.rank != 0: return
         self.model.eval()
-        self.print_log('Eval epoch: {}'.format(epoch + 1))
+        self.print_log(f'预训练评估轮次: {epoch + 1}')
         for ln in loader_name:
-            loss_value = []
-            score_dict = {}
-
-            try:
-                process = tqdm(self.data_loader[ln], ncols=50)
-            except KeyboardInterrupt:
-                process.close()
-                raise
-            # process.close()
-
-            for batch_idx, (data, edges, label, index) in enumerate(process):
+            loss_value, score_dict, all_labels, all_probs = [], {}, [], []
+            for batch_idx, (data, edges, label, index) in enumerate(self.data_loader[ln]):
                 x_node, edge, label = self.converse2tensor(data, edges, label)
+                
+                #x_new = self.model.module.emb(x_node)
+                yw = self.model.module.prediction_whole(x_node, edge, is_large_graph=False)
+                lossW = self.losses(yw, label)
 
-                x_new = self.model.emb(x_node)
-                yw = self.model.prediction_whole(x_new, edge)
-                lossC = self.losses(yw, label)
-
-                loss_value.extend(lossC.data.cpu().numpy())
-                sub_list = self.data_loader[ln].dataset.sample_name[index] if len(index) > 1 \
-                    else [self.data_loader[ln].dataset.sample_name[index]]
+                probs = F.softmax(yw, dim=1)[:, 1].detach().cpu().numpy()
+                all_probs.extend(probs)
+                all_labels.extend(label.cpu().numpy())
+                loss_value.extend(lossW.data.cpu().numpy())
+                sub_list = self.data_loader[ln].dataset.sample_name[index] if len(index) > 1 else [self.data_loader[ln].dataset.sample_name[index]]
                 score_dict.update(dict(zip(sub_list, yw.data.cpu().numpy())))
 
             loss = np.mean(loss_value)
             accuracy = self.data_loader[ln].dataset.top_k(np.array(list(score_dict.values())), 1)
-            if accuracy > self.best_acc and ln == 'test':
-                self.best_acc = accuracy
-            self.print_log(f'ln: {ln}, acc: {accuracy}, model: {self.model_name}')
-            if ln == 'train_val':
-                if self.arg.scheduler == 'auto':
-                    self.lr_scheduler.step(loss)
-                elif self.arg.scheduler == 'step':
-                    self.lr_scheduler.step()
-                else:
-                    raise ValueError()
-                self.val_writer.add_scalar(self.model_name + '/acc', accuracy, self.global_step)
-                self.val_writer.add_scalar(self.model_name + '/loss_causal', lossC.mean().item(), self.global_step)
-            elif ln == 'test':
-                self.test_writer.add_scalar(self.model_name + '/acc', accuracy, self.global_step)
-                self.test_writer.add_scalar(self.model_name + '/loss_causal', lossC.mean().item(), self.global_step)
-
-            self.print_log('\tMean {} loss of {} batches: {}.'.format(
-                ln, len(self.data_loader[ln]), np.mean(loss_value)))
-
+            
+            from sklearn.metrics import roc_auc_score
+            try: auc_score = roc_auc_score(all_labels, all_probs)
+            except ValueError: auc_score = 0.0
+            
+            self.print_log(f'\t{ln}数据集准确率: {accuracy:.4f}, AUC: {auc_score:.4f}')
+            
+            writer = self.val_writer if ln == 'val' else self.test_writer
+            writer.add_scalar(self.model_name + '/acc', accuracy, self.global_step)
+            writer.add_scalar(self.model_name + '/loss_w', loss, self.global_step)
+            writer.add_scalar(self.model_name + '/auc', auc_score, self.global_step)
+            
+            if ln == 'val':
+                if self.arg.scheduler == 'auto': self.lr_scheduler.step(loss)
+                else: self.lr_scheduler.step()
+                if accuracy > self.best_val_acc:
+                    self.best_val_acc = accuracy
+                    self.best_model_state = self.model.module.state_dict().copy()
+                    self.best_epoch = epoch
+                    self.print_log(f"发现新的最佳预训练模型 (验证集准确率: {accuracy:.4f}, AUC: {auc_score:.4f})")
+            
+            self.epoch_results[epoch][ln] = {'loss_all': loss, 'acc_official': accuracy, 'auc': auc_score}
             if save_score:
-                with open(os.path.join(self.work_dir, 'epoch', 'epoch{}_{}_score.pkl'.format(epoch + 1, ln)), 'wb') as f:
+                with open(os.path.join(self.work_dir, 'epoch', f'epoch{epoch + 1}_{ln}_score.pkl'), 'wb') as f:
                     pickle.dump(score_dict, f)
 
     def train(self, epoch, save_model=False):
+        # 设置模型为训练模式
         self.mask.train()
         self.model.train()
-        self.print_log('Training epoch: {}'.format(epoch + 1))
+
+        # [最终方案] 分阶段设置不同的稀疏性惩罚强度
+        is_first_stage = epoch < self.arg.stage_transition_epoch
+        if is_first_stage:
+            # 第一阶段：使用一个较小且平滑增长的惩罚，鼓励探索
+            lambda_reg = 0.05 * (1 + epoch / self.arg.num_epoch)
+        else:
+
+            lambda_reg = 1.0 
+
+        # 准备训练环境
         loader = self.data_loader['train']
-        self.train_writer.add_scalar(self.model_name + '/epoch', epoch, self.global_step)
-        self.record_time()
-        timer = dict(dataloader=0.001, model=0.001, statistics=0.001)
-        try:
-            process = tqdm(loader, ncols=50)
-        except KeyboardInterrupt:
-            process.close()
-            raise
-        process.close()
+        if self.rank == 0:
+            self.train_writer.add_scalar(self.model_name + '/epoch', epoch, self.global_step)
+            self.train_writer.add_scalar(self.model_name + '/lambda_reg', lambda_reg, self.global_step)
+            self.record_time()
 
-        scores, true = [], []
-        self.print_log('\tReg coefficient: {:.4f}.'.format(self.reg[epoch]))
-        for batch_idx, (data, edges, label, index) in enumerate(process):
+        # 初始化损失和准确率记录器 (仅在主进程上有用)
+        losses_mask = {'all': [], 'causal': [], 'counterfactual': [], 'invariance': [], 'variability': [], 'guide': [], 'sparsity_reg': []}
+        losses_gnn = {'all': [], 'causal': [], 'invariance': [], 'l1_reg': []}
+        accuracies_mask, accuracies_gnn = {}, {}
+
+        # 遍历批次数据
+        for batch_idx, (data, edges, label, index) in enumerate(loader):
             self.global_step += 1
-
             x_node, edge, label = self.converse2tensor(data, edges, label)
-            timer['dataloader'] += self.split_time()
 
-            # fix gcn, update mask
-            masks, sparsity = self.mask(train=True)
-            for name, p in self.model.named_parameters():
-                p.requires_grad = False
+            # ==================== 掩码训练阶段 ====================
+            for param in self.model.parameters(): param.requires_grad = False
+            masks, sparsity = self.mask.module(train=True) # 使用 .module 访问原始模型
+            x_new = x_node
 
-            x_new = self.model.emb(x_node)
-            yc = self.model.prediction_causal(x_new, edge, masks)
-            lossC = self.losses(yc, label)
-            if self.arg.LR > 0:
-                yr = self.model.prediction_combine(x_new, edge, masks)
-                lossR = torch.stack([self.losses(yr[i], label[i].repeat(len(index))) for i in range(len(index))], dim=0)
-                lossAll = lossC.mean() + self.arg.LR * lossR.mean()
-                self.train_writer.add_scalar(self.model_name + '/loss_comb', lossR.mean().item(), self.global_step)
+            if is_first_stage:
+                result_mask = self._compute_first_stage_mask_loss(x_new, edge, masks, label, epoch, lambda_reg)
+                if self.rank == 0:
+                    accuracies_mask.setdefault('invariance', []).append(self._calculate_accuracy(result_mask['predictions']['invariance'], label))
+                    accuracies_mask.setdefault('variability', []).append(self._calculate_accuracy(result_mask['predictions']['variability'], label))
             else:
-                lossAll = lossC.mean()
-
-            if self.arg.LO > 0:
-                yo = self.model.prediction_counterfactual(x_new, edge, masks)
-                lossO = - self.losses(yo, label)
-                lossAll += self.arg.LO * lossO.mean()
-                self.train_writer.add_scalar(self.model_name + '/loss_opp', lossO.mean().item(), self.global_step)
-            if self.reg[epoch] < 1 and self.arg.LG > 0:
-                if self.arg.LR > 0:
-                    guide_node = self.guide(M=masks[0] * masks[1])
-                else:
-                    guide_node = self.guide(M=masks[0])
-                lossAll += (1 - self.reg[epoch]) * self.arg.LG * guide_node
-                self.train_writer.add_scalar(self.model_name + '/guide', guide_node.item(), self.global_step)
+                result_mask = self._compute_second_stage_mask_loss(x_new, edge, masks, label, lambda_reg)
+                if self.rank == 0:
+                    accuracies_mask.setdefault('invariance', []).append(self._calculate_accuracy(result_mask['predictions']['invariance'], label))
+                    accuracies_mask.setdefault('causal', []).append(self._calculate_accuracy(result_mask['predictions']['causal'], label))
+                    accuracies_mask.setdefault('counterfactual', []).append(self._calculate_accuracy(result_mask['predictions']['counterfactual'], label))
 
             self.optimizer_mask.zero_grad()
-            lossAll.backward()
+            result_mask['loss']['all'].backward()
             self.optimizer_mask.step()
+            if self.rank == 0: self._record_mask_losses(losses_mask, result_mask)
 
-            for name, p in self.model.named_parameters():
-                p.requires_grad = True
-
-            # update gcn
-            masks, sparsity = self.mask(train=False)
+            # ==================== GNN训练阶段 ====================
+            for param in self.model.parameters(): param.requires_grad = True
+            # 获取更新后的掩码(不计算梯度)
+            masks, _ = self.mask.module(train=False)
             masks = [mm.detach() for mm in masks]
+            x_new = x_node
 
-            x_new = self.model.emb(x_node)
-            yc = self.model.prediction_causal(x_new, edge, masks)
-            lossC = self.losses(yc, label)
-            if self.arg.LR > 0:
-                yr = self.model.prediction_combine(x_new, edge, masks)
-                lossR = torch.stack([self.losses(yr[i], label[i].repeat(len(index))) for i in range(len(index))], dim=0)
-                lossAll = lossC.mean() + self.arg.LR * lossR.mean()
-                self.train_writer.add_scalar(self.model_name + '/loss_comb', lossR.mean().item(), self.global_step)
-            elif self.arg.LR == 0:
-                lossAll = lossC.mean()
+            if is_first_stage:
+                result_gnn = self._compute_first_stage_gnn_loss(x_new, edge, masks, label)
+                if self.rank == 0: accuracies_gnn.setdefault('invariance', []).append(self._calculate_accuracy(result_gnn['predictions']['invariance'], label))
             else:
-                raise ValueError
+                result_gnn = self._compute_second_stage_gnn_loss(x_new, edge, masks, label)
+                if self.rank == 0:
+                    accuracies_gnn.setdefault('invariance', []).append(self._calculate_accuracy(result_gnn['predictions']['invariance'], label))
+                    accuracies_gnn.setdefault('causal', []).append(self._calculate_accuracy(result_gnn['predictions']['causal'], label))
 
             self.optimizer.zero_grad()
-            lossAll.backward()
+            result_gnn['loss']['all'].backward()
             self.optimizer.step()
 
-            timer['model'] += self.split_time()
+            # [恢复] 在主进程上记录GNN损失和当前的掩码和
+            if self.rank == 0: 
+                self._record_gnn_losses(losses_gnn, result_gnn)
+                # 这句是关键，为print_epoch_summary准备数据
+                self.current_mask_sums = {'node': masks[0].sum().item(), 'edge': masks[1].sum().item()}
 
-            true.extend(self.data_loader['train'].dataset.label[index])
-            scores.extend(yc.view(-1).data.cpu().numpy())
+        # ==================== Epoch结束后的处理 ====================
+        if self.rank == 0:
+            # 将一个epoch内所有batch的平均损失和准确率存入结果字典
+            train_results = {
+                'mask': {k: np.mean(v) for k, v in losses_mask.items() if v},
+                'gnn': {k: np.mean(v) for k, v in losses_gnn.items() if v}
+            }
+            for k, v in accuracies_mask.items(): train_results['mask'][f'acc_{k}'] = np.mean(v)
+            for k, v in accuracies_gnn.items(): train_results['gnn'][f'acc_{k}'] = np.mean(v)
+            self.epoch_results[epoch]['train'] = train_results
 
-            value, predict_label = torch.max(yc.data, 1)
-            acc = torch.mean((predict_label == label.data).float())
-            self.train_writer.add_scalar(self.model_name + '/acc', acc.item(), self.global_step)
-            if self.arg.LR > 0:
-                M1_node, M2_node, M1_edge, M2_edge = masks
-                self.train_writer.add_scalar(self.model_name + '/spar_node1', M1_node.mean().item(), self.global_step)
-                self.train_writer.add_scalar(self.model_name + '/spar_edge1', M1_edge.mean().item(), self.global_step)
-                self.train_writer.add_scalar(self.model_name + '/spar_node12', (M1_node * M2_node).mean().item(), self.global_step)
-                self.train_writer.add_scalar(self.model_name + '/spar_edge12', (M1_edge * M2_edge).mean().item(), self.global_step)
-            else:
-                M1_node, M1_edge = masks
-                self.train_writer.add_scalar(self.model_name + '/spar_node1', M1_node.mean().item(), self.global_step)
-                self.train_writer.add_scalar(self.model_name + '/spar_edge1', M1_edge.mean().item(), self.global_step)
+            # 如果需要，保存模型
+            if save_model:
+                state_dict = self.mask.module.state_dict()
+                save_path = os.path.join(self.work_dir, 'epoch', f'save{epoch + 1}_mask.pt')
+                torch.save(state_dict, save_path)
 
-            self.train_writer.add_scalar(self.model_name + '/loss_causal', lossC.mean().item(), self.global_step)
-            self.train_writer.add_scalar(self.model_name + '/sparsity', sparsity.item(), self.global_step)
-            self.train_writer.add_scalar(self.model_name + '/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
-            self.train_writer.add_scalar(self.model_name + '/lr_mask', self.optimizer_mask.param_groups[0]['lr'], self.global_step)
-            timer['statistics'] += self.split_time()
-
-        # statistics of time consumption and loss
-        proportion = {
-            k: '{:02d}%'.format(int(round(v * 100 / sum(timer.values()))))
-            for k, v in timer.items()
-        }
-        self.print_log('\tTime consumption: [Data]{dataloader}, [Network]{model}, [Evaluate]{statistics}'.format(**proportion))
-
-        if save_model and epoch in [20, 24, self.arg.num_epoch-1]:
-            state_dict = self.mask.state_dict()
-            torch.save(state_dict, os.path.join(self.work_dir, 'epoch', f'save{epoch + 1}_mask.pt'))
-
-    def eval(self, epoch, save_score=False, loader_name=['test']):
+    # 替换您 Processor 类中的整个 eval 函数
+    def eval(self, epoch, save_score=False, loader_name=['val']):
+        if self.rank != 0: return
         self.mask.eval()
         self.model.eval()
-        self.print_log('Eval epoch: {}'.format(epoch + 1))
+        
+        # [修改] 判断当前所处阶段，用于保存正确的文件名
+        stage_name = "stage1" if epoch < self.arg.stage_transition_epoch else "stage2"
+
         for ln in loader_name:
-            loss_value1, loss_value2 = [], []
-            score_dict = {}
-
-            try:
-                process = tqdm(self.data_loader[ln], ncols=50)
-            except KeyboardInterrupt:
-                process.close()
-                raise
-            # process.close()
-
-            for batch_idx, (data, edges, label, index) in enumerate(process):
+            loss_values, accuracies, invariance_scores, all_labels, all_probs = [], [], {}, [], []
+            for batch_idx, (data, edges, label, index) in enumerate(self.data_loader[ln]):
                 x_node, edge, label = self.converse2tensor(data, edges, label)
+                
+                # [核心修改] 调用mask，并正确解包返回的三个值
+                masks, probs, _ = self.mask.module(train=False, return_probs=True) # 用 _ 接收不需要的sparsity
+                
+                # 将结果保存下来，以便在找到最佳模型时使用
+                current_masks = [m.clone() for m in masks]
+                current_probs = [p.clone() for p in probs]
+                
+                # [修改] 我们在这里获取当前masks，以便在找到最佳模型时保存
+                current_masks = [m.clone() for m in masks]
+                
+                yci = self.model.module.prediction_causal_invariance(x_node, edge, masks, is_large_graph=False)
+                
+                loss_ci = self.losses(yci, label)
+                acc_ci = self._calculate_accuracy(yci, label)
+                loss_values.append(loss_ci.mean().item())
+                accuracies.append(acc_ci)
+                
+                probs = F.softmax(yci, dim=1)[:, 1].detach().cpu().numpy()
+                all_probs.extend(probs)
+                all_labels.extend(label.cpu().numpy())
+                
+                sub_list = self.data_loader[ln].dataset.sample_name[index] if len(index) > 1 else [self.data_loader[ln].dataset.sample_name[index]]
+                invariance_scores.update(dict(zip(sub_list, yci.data.cpu().numpy())))
 
-                masks, sparsity = self.mask(train=False)
+            avg_loss = np.mean(loss_values) if loss_values else 0
+            official_accuracy = self.data_loader[ln].dataset.top_k(np.array(list(invariance_scores.values())), 1)
+            
+            try:
+                from sklearn.metrics import roc_auc_score
+                auc_score = roc_auc_score(all_labels, all_probs)
+            except ValueError:
+                auc_score = 0.0
 
-                x_new = self.model.emb(x_node)
-                yc = self.model.prediction_causal(x_new, edge, masks)
-                lossC = self.losses(yc, label)
-
-                yo = self.model.prediction_counterfactual(x_new, edge, masks)
-                lossO = - self.losses(yo, label)
-
-                if self.arg.LR > 0:
-                    guide_node = self.guide(M=masks[0] * masks[1])
-                    yr = self.model.prediction_combine(x_new, edge, masks)
-                    lossR = torch.stack([self.losses(yr[i], label[i].repeat(len(index))) for i in range(len(index))], dim=0)
-                    loss1 = lossC + torch.mean(lossR, dim=1) + self.arg.LO * lossO + \
-                            (1 - self.reg[epoch]) * self.arg.LG * guide_node
-                    loss2 = lossC + torch.mean(lossR, dim=1)
-                elif self.arg.LR == 0:
-                    guide_node = self.guide(M=masks[0])
-                    loss1 = lossC + self.arg.LO * lossO + \
-                            (1 - self.reg[epoch]) * self.arg.LG * guide_node
-                    loss2 = lossC
-                else:
-                    raise ValueError
-
-                loss_value1.extend(loss1.data.cpu().numpy())
-                loss_value2.extend(loss2.data.cpu().numpy())
-                sub_list = self.data_loader[ln].dataset.sample_name[index] if len(index) > 1 \
-                    else [self.data_loader[ln].dataset.sample_name[index]]
-                score_dict.update(dict(zip(sub_list, yc.data.cpu().numpy())))
-
-            loss1 = np.mean(loss_value1)
-            loss2 = np.mean(loss_value2)
-            accuracy = self.data_loader[ln].dataset.top_k(np.array(list(score_dict.values())), 1)
-            if accuracy > self.best_acc and ln == 'test':
-                self.best_acc = accuracy
-            self.print_log(f'ln: {ln}, acc: {accuracy}, model: {self.model_name}')
-            if ln == 'train_val':
+            if ln == 'val':
                 if self.arg.scheduler == 'auto':
-                    self.lr_scheduler_mask.step(loss2)
-                    self.lr_scheduler.step(loss1)
-                elif self.arg.scheduler == 'step':
+                    self.lr_scheduler_mask.step(avg_loss)
+                    self.lr_scheduler.step(avg_loss)
+                else:
                     self.lr_scheduler_mask.step()
                     self.lr_scheduler.step()
-                else:
-                    raise ValueError()
-                self.val_writer.add_scalar(self.model_name + '/acc', accuracy, self.global_step)
-                self.val_writer.add_scalar(self.model_name + '/loss_causal', lossC.mean().item(), self.global_step)
-                self.val_writer.add_scalar(self.model_name + '/loss_opp', lossO.mean().item(), self.global_step)
-                if self.arg.LR > 0:
-                    self.val_writer.add_scalar(self.model_name + '/loss_comb', lossR.mean().item(), self.global_step)
-                self.val_writer.add_scalar(self.model_name + '/guide', guide_node.item(), self.global_step)
-            elif ln == 'test':
-                self.test_writer.add_scalar(self.model_name + '/acc', accuracy, self.global_step)
-                self.test_writer.add_scalar(self.model_name + '/loss_causal', lossC.mean().item(), self.global_step)
-                self.test_writer.add_scalar(self.model_name + '/loss_opp', lossO.mean().item(), self.global_step)
-                if self.arg.LR > 0:
-                    self.test_writer.add_scalar(self.model_name + '/loss_comb', lossR.mean().item(), self.global_step)
-                self.test_writer.add_scalar(self.model_name + '/guide', guide_node.item(), self.global_step)
 
+                if official_accuracy > self.best_val_acc:
+                    self.best_val_acc = official_accuracy
+                    self.best_model_state = self.model.module.state_dict().copy()
+                    self.best_mask_state = self.mask.module.state_dict().copy()
+                    self.best_epoch = epoch
+                    self.print_log(f"发现新的最佳模型 (验证集准确率: {official_accuracy:.4f}, AUC: {auc_score:.4f})")
+                    
+                    # [修改] 调用保存函数，保存当前最佳的因果图
+                    self._save_causal_artifacts(current_masks, current_probs, stage_name)
+            
+            eval_results = {'loss_all': avg_loss, 'acc_official': official_accuracy, 'auc': auc_score}
+            self.epoch_results[epoch][ln] = eval_results
             if save_score:
-                with open(os.path.join(self.work_dir, 'epoch', 'epoch{}_{}_score.pkl'.format(epoch + 1, ln)), 'wb') as f:
-                    pickle.dump(score_dict, f)
+                with open(os.path.join(self.work_dir, 'epoch', f'epoch{epoch + 1}_{ln}_score.pkl'), 'wb') as f:
+                    pickle.dump(invariance_scores, f)
+
+    def compute_l1_regularization(self, model_module):
+        l1_reg = 0
+        for name, param in model_module.named_parameters():
+            if 'mlp_causal.0.weight' in name:
+                l1_reg += torch.sum(torch.abs(param))
+        return self.lambda_l1 * l1_reg
+    
+    def _compute_first_stage_mask_loss(self, x_new, edge, masks, label, epoch, lambda_reg=0.05):
+        yci = self.model.module.prediction_causal_invariance(x_new, edge, masks, is_large_graph=True)
+        loss_ci = self.losses(yci, label)
+        ycv = self.model.module.prediction_causal_variability(x_new, edge, masks, is_large_graph=True)
+        loss_cv = self.entropy_loss(ycv)
+        reg_loss = self.mask.module.compute_sparsity_regularization(lambda_reg=lambda_reg)
+        loss_all = self.arg.LCI * loss_ci.mean() + self.arg.LCV * loss_cv.mean()  + reg_loss
+        return {'loss': {'all': loss_all, 'invariance': loss_ci.mean(), 'variability': loss_cv.mean(),  'sparsity_reg': reg_loss}, 
+                'predictions': {'invariance': yci, 'variability': ycv}}
+
+    def _compute_second_stage_mask_loss(self, x_new, edge, masks, label, lambda_reg=0.1):
+        yci = self.model.module.prediction_causal_invariance(x_new, edge, masks, is_large_graph=True)
+        loss_ci = self.losses(yci, label)
+        yc = self.model.module.prediction_causal(x_new, edge, masks, is_large_graph=True)
+        loss_c = self.losses(yc, label)
+        yo = self.model.module.prediction_counterfactual(x_new, edge, masks, is_large_graph=True)
+        loss_o = self.loss(yo, 1 - label)
+        reg_loss = self.mask.module.compute_sparsity_regularization(lambda_reg=lambda_reg)
+        loss_all = (self.arg.LC * loss_c.mean() + self.arg.LO * loss_o.mean() + self.arg.LCI * loss_ci.mean() + reg_loss)
+        return {'loss': {'all': loss_all, 'causal': self.arg.LC * loss_c.mean(), 'counterfactual': self.arg.LO * loss_o.mean(), 'invariance': self.arg.LCI * loss_ci.mean(), 'sparsity_reg': reg_loss}, 
+                'predictions': {'causal': yc, 'counterfactual': yo, 'invariance': yci}}
+
+    def _compute_first_stage_gnn_loss(self, x_new, edge, masks, label):
+        yci = self.model.module.prediction_causal_invariance(x_new, edge, masks, is_large_graph=True)
+        loss_ci = self.losses(yci, label)
+        l1_loss = self.compute_l1_regularization(self.model.module)
+        loss_all = loss_ci.mean() + l1_loss
+        return {'loss': {'all': loss_all, 'invariance': loss_ci.mean(), 'l1_reg': l1_loss}, 'predictions': {'invariance': yci}}
+
+    def _compute_second_stage_gnn_loss(self, x_new, edge, masks, label):
+        yc = self.model.module.prediction_causal(x_new, edge, masks, is_large_graph=True)
+        loss_c = self.losses(yc, label)
+        yci = self.model.module.prediction_causal_invariance(x_new, edge, masks, is_large_graph=True)
+        loss_ci = self.losses(yci, label)
+        loss_all = self.arg.LCI * loss_ci.mean() + self.arg.LC * loss_c.mean()
+        return {'loss': {'all': loss_all, 'causal': self.arg.LC * loss_c.mean(), 'invariance': loss_ci.mean()}, 
+                'predictions': {'causal': yc, 'invariance': yci}}
+
+    def _record_mask_losses(self, losses_container, current_losses):
+        for key, value in current_losses['loss'].items():
+            if key in losses_container and isinstance(value, torch.Tensor):
+                losses_container[key].append(value.item())
+
+    def _record_gnn_losses(self, losses_container, current_losses):
+        for key, value in current_losses['loss'].items():
+            if key in losses_container and isinstance(value, torch.Tensor):
+                losses_container[key].append(value.item())
+
+    def _calculate_accuracy(self, predictions, labels):
+        _, predict_label = torch.max(predictions.data, 1)
+        acc = torch.mean((predict_label == labels.data).float())
+        return acc.item()
+
+    def entropy_loss(self, logits):
+        probs = F.softmax(logits, dim=1)
+        log_probs = torch.log(probs + 1e-10)
+        entropy = -torch.sum(probs * log_probs, dim=1)
+        return -entropy
 
     def converse2tensor(self, data, edges, label):
-        data = torch.FloatTensor(data.float()).cuda(self.output_device)
-        label = torch.LongTensor(label.long()).cuda(self.output_device)
-        all_edge = torch.FloatTensor(edges.float()).cuda(self.output_device)
+        data = torch.FloatTensor(data.float()).to(self.rank, non_blocking=True)
+        label = torch.LongTensor(label.long()).to(self.rank, non_blocking=True)
+        all_edge = torch.FloatTensor(edges.float()).to(self.rank, non_blocking=True)
         return data, all_edge, label
 
     def guide(self, M):
-        aa = torch.norm(self.DiffNode.squeeze(1) - M[:, 0], p=2)
+        aa = torch.norm(self.DiffNode.squeeze(1) - M, p=2)
         return aa
 
-    def print_time(self):
-        localtime = time.asctime(time.localtime(time.time()))
-        self.print_log("Local current time :  " + localtime)
-
-    def print_log(self, str, print_time=True):
+    def print_log(self, text_str, print_time=True, log_type=None):
+        if self.rank != 0: return
+        # 省略颜色代码以简化
+        prefix = "" if not log_type else f"[{log_type.upper()}] "
         if print_time:
             localtime = time.asctime(time.localtime(time.time()))
-            str = "[ " + localtime + ' ] ' + str
-        print(str)
+            text_str = f"[{localtime}] {prefix}{text_str}"
+        else:
+            text_str = prefix + text_str
+        print(text_str)
         if self.arg.print_log:
             with open(os.path.join(self.work_dir, 'log.txt'), 'a') as f:
-                print(str, file=f)
+                print(text_str.encode('utf-8').decode('utf-8'), file=f)
 
     def record_time(self):
         self.cur_time = time.time()
@@ -555,12 +940,157 @@ class Processor:
         split_time = time.time() - self.cur_time
         self.record_time()
         return split_time
+        
+    def save_best_model(self, stage='pretrain', epoch=None):
+        if self.rank != 0: return
+        save_dir = os.path.join(self.work_dir, 'best_models')
 
+        if epoch is None:
+            model_state = self.best_model_state
+            mask_state = self.best_mask_state
+        else:
+            model_state = self.model.module.state_dict()
+            mask_state = self.mask.module.state_dict() if hasattr(self, 'mask') else None
+
+        if model_state: torch.save(model_state, os.path.join(save_dir, f'best_{stage}_model.pt'))
+        if mask_state: torch.save(mask_state, os.path.join(save_dir, f'best_{stage}_mask.pt'))
+
+        # 省略了保存logits等逻辑，因为它们依赖于best_masks等变量，这些变量在eval中被设置
+        self.print_log(f"已保存{stage}阶段最佳模型(轮次 {self.best_epoch+1})", log_type="info")
+
+    def load_best_model(self, stage='pretrain'):
+        if self.rank != 0: return
+        save_dir = os.path.join(self.work_dir, 'best_models')
+        model_path = os.path.join(save_dir, f'best_{stage}_model.pt')
+        mask_path = os.path.join(save_dir, f'best_{stage}_mask.pt')
+
+        if os.path.exists(model_path):
+            self.model.module.load_state_dict(torch.load(model_path, map_location=f'cuda:{self.rank}'))
+            self.print_log(f"已加载{stage}阶段最佳模型", log_type="info")
+        if stage != 'pretrain' and os.path.exists(mask_path):
+            self.mask.module.load_state_dict(torch.load(mask_path, map_location=f'cuda:{self.rank}'))
+            self.print_log(f"已加载{stage}阶段最佳掩码", log_type="info")
+            
+    def _save_causal_artifacts(self, masks, probs, stage_name):
+        """
+        将CausalMask识别出的因果节点/边及其对应的因果概率值保存下来。
+        """
+        if self.rank != 0:
+            return
+
+        node_mask_hard, edge_mask_hard = masks
+        node_probs, edge_probs = probs
+
+        # --- 保存二元的（0/1）结果 ---
+        causal_node_indices = np.where(node_mask_hard.cpu().numpy() == 1)[0]
+        node_path = os.path.join(self.work_dir, 'best_models', f'best_{stage_name}_causal_nodes.csv')
+        np.savetxt(node_path, causal_node_indices, fmt='%d', header='causal_node_index', comments='')
+        
+        edge_path = os.path.join(self.work_dir, 'best_models', f'best_{stage_name}_causal_edges.csv')
+        pd.DataFrame(edge_mask_hard.cpu().numpy()).to_csv(edge_path, header=False, index=False)
+        self.print_log(f"已将 {stage_name} 阶段最佳二元因果图保存。", log_type="info")
+        
+        # --- 保存连续的、可排序的因果概率值 ---
+        node_scores_df = pd.DataFrame({
+            'node_index': np.arange(len(node_probs)),
+            'causal_probability': node_probs.cpu().numpy()
+        })
+        node_scores_df = node_scores_df.sort_values(by='causal_probability', ascending=False)
+        node_scores_path = os.path.join(self.work_dir, 'best_models', f'best_{stage_name}_node_scores.csv')
+        node_scores_df.to_csv(node_scores_path, index=False, float_format='%.6f')
+
+        edge_probs_np = edge_probs.cpu().numpy()
+        source_nodes, target_nodes = np.where(self.mask.module.learnable_mask.cpu().numpy() > 0)
+        edge_scores_df = pd.DataFrame({
+            'source_node': source_nodes,
+            'target_node': target_nodes,
+            'causal_probability': edge_probs_np[source_nodes, target_nodes]
+        })
+        edge_scores_df = edge_scores_df.sort_values(by='causal_probability', ascending=False)
+        edge_scores_path = os.path.join(self.work_dir, 'best_models', f'best_{stage_name}_edge_scores.csv')
+        edge_scores_df.to_csv(edge_scores_path, index=False, float_format='%.6f')
+
+        self.print_log(f"已将 {stage_name} 阶段的因果概率值保存至CSV文件，可供排序和筛选。", log_type="info")
+
+    def _print_final_summary(self):
+        """
+        在所有训练结束后，打印各阶段最佳模型的性能总结。
+        """
+        if self.rank != 0:
+            return
+            
+        self.print_log("="*120, print_time=True)
+        self.print_log("训练流程完成 - 各阶段最佳模型性能总结", log_type="result")
+        self.print_log("="*120, print_time=False)
+
+        header = f"{'阶段':<20} | {'最佳轮次':<10} | {'验证集 ACC':<15} | {'验证集 AUC':<15} | {'测试集 ACC':<15} | {'测试集 AUC':<15}"
+        self.print_log(header, print_time=False)
+        self.print_log("-"*120, print_time=False)
+
+        # 打印预训练阶段结果
+        if self.best_epoch_pretrain != -1:
+            res = self.epoch_results[self.best_epoch_pretrain]
+            val_res = res.get('val', {})
+            test_res = res.get('test', {})
+            log_str = (f"{'预训练':<20} | {self.best_epoch_pretrain + 1:<10} | "
+                       f"{val_res.get('acc_official', 0.0):<15.4f} | {val_res.get('auc', 0.0):<15.4f} | "
+                       f"{test_res.get('acc_official', 0.0):<15.4f} | {test_res.get('auc', 0.0):<15.4f}")
+            self.print_log(log_str, print_time=False)
+
+        # 打印第一阶段结果
+        if self.best_epoch_stage1 != -1:
+            res = self.epoch_results[self.best_epoch_stage1]
+            val_res = res.get('val', {})
+            test_res = res.get('test', {})
+            log_str = (f"{'第一阶段':<20} | {self.best_epoch_stage1 + 1:<10} | "
+                       f"\033[1m{val_res.get('acc_official', 0.0):<15.4f}\033[0m | "
+                       f"{val_res.get('auc', 0.0):<15.4f} | "
+                       f"\033[1m{test_res.get('acc_official', 0.0):<15.4f}\033[0m | "
+                       f"{test_res.get('auc', 0.0):<15.4f}")
+            self.print_log(log_str, print_time=False)
+
+        # 打印第二阶段结果
+        if self.best_epoch_stage2 != -1:
+            res = self.epoch_results[self.best_epoch_stage2]
+            val_res = res.get('val', {})
+            test_res = res.get('test', {})
+            log_str = (f"{'第二阶段 (最终模型)':<20} | {self.best_epoch_stage2 + 1:<10} | "
+                       f"\033[1m\033[33m{val_res.get('acc_official', 0.0):.4f}\033[0m{'':<9} | "
+                       f"{val_res.get('auc', 0.0):<15.4f} | "
+                       f"\033[1m\033[33m{test_res.get('acc_official', 0.0):.4f}\033[0m{'':<9} | "
+                       f"{test_res.get('auc', 0.0):<15.4f}")
+            self.print_log(log_str, print_time=False)
+
+        self.print_log("-"*120, print_time=False)        
+        
+        
+        
+# DDP主工作函数
+def main_worker(rank, world_size, arg):
+    os.environ['MASTER_ADDR'] = '127.0.0.1'  # 保持我们之前的网络修复
+    os.environ['MASTER_PORT'] = '12355' 
+    
+    # --- 【调试修改】: 添加第一行打印日志 ---
+    # 为了区分不同进程的输出，我们加入 rank 信息
+    print(f"[Rank {rank}] 准备初始化进程组 (Attempting to init process group)...")
+    # ------------------------------------
+
+    # 绝大概率程序会卡在下面这一行
+    dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
+    
+    # --- 【调试修改】: 添加第二行打印日志 ---
+    # 如果您能看到这条消息，说明初始化成功了
+    print(f"[Rank {rank}] 成功：进程组初始化完成！(Process group initialized successfully!)")
+    # ------------------------------------
+
+    torch.cuda.set_device(rank)
+    seed_torch(arg.seed + rank)
+    processor = Processor(rank, world_size, arg)
+    processor.start()
+    dist.destroy_process_group()
 
 if __name__ == '__main__':
     parser = get_parser()
-
-    # load arg form config file
     p = parser.parse_args()
     if p.config is not None:
         with open(p.config, 'r') as f:
@@ -571,9 +1101,17 @@ if __name__ == '__main__':
                 print('WRONG ARG: {}'.format(k))
                 assert (k in key)
         parser.set_defaults(**default_arg)
-
     arg = parser.parse_args()
-    seed_torch(arg.seed)
-    processor = Processor(arg)
-    processor.start()
 
+    # DDP启动逻辑
+    if torch.cuda.is_available():
+        world_size = torch.cuda.device_count()
+        print(f"检测到 {world_size} 个可用的GPU。")
+    else:
+        print("未检测到GPU，DDP训练无法进行。"); exit()
+
+    if world_size < 2:
+        print("GPU数量少于2，将以单卡模式运行。")
+        main_worker(0, 1, arg)
+    else:
+        mp.spawn(main_worker, args=(world_size, arg), nprocs=world_size, join=True)
