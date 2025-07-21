@@ -3,44 +3,82 @@ import pickle
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
-from scipy.spatial.distance import cdist
-import scipy.spatial.distance as ssp_dist
-
 
 class ConstructGraph:
-    def __init__(self, node_type=None, edge_type='corr', dist_type='gau', adj_norm='DAD'):
+    def __init__(self, node_type=None, edge_type='corr', dist_type='gau', adj_norm='DAD', build_large_graph=False, random_seed=42):
         self.node_type = node_type
         self.edge_type = edge_type
         self.dist_type = dist_type
         self.adj_norm = adj_norm
+        self.build_large_graph = build_large_graph
+        self.random_seed = random_seed
 
-    def construct(self, pxs, embedding, coord):
-        B, P = pxs.shape[:2]  # 8,200
-        pxs = pxs.reshape(B, P, -1)  # [B,P,w**3]
-        node_components = self.node_type.split('_')
-        components = {'px': pxs, 'emb': embedding, 'coord': coord}
-        node = np.concatenate([components[kk] for kk in node_components if kk != 'edge'], axis=-1)
+    def construct(self, pxs, embedding, coord, labels=None, consistent_mask=None):
+        """
+        [最终优雅版]
+        该函数现在统一处理大小图的构建，核心逻辑是：
+        1. 准备一个标准化的、带自环的基础图 (base_edge)。
+        2. 根据模式（大图/小图）使用这个基础图进行组装。
+        """
+        B, P = pxs.shape[:2]
 
-        edge_list = []
-        for i in range(B):
-            node_i = node[i, :, :]
-            coord_i = coord[i, :, :]
-            # Calculate node feature similarity as edges
-            edge_square = cal_similarity_matrix(node_i, type1=self.edge_type)
-            # Distance weighting
-            if self.dist_type is not None and self.dist_type != 'None':
-                edge_square *= cal_distance(coord_i, dist_type=self.dist_type)
-            # Laplacian normalization
-            if self.adj_norm is not None and self.adj_norm != 'None':
-                edge_square[np.diag_indices_from(edge_square)] = 0
-                edge_square = normalize_digraph(edge_square, norm_type=self.adj_norm)
-            # Finish
-            edge_list.append(edge_square)
+        if consistent_mask is None:
+            raise ValueError("错误：此流程强制要求提供预计算的图 (consistent_mask)。")
 
-        edges = np.stack(edge_list, axis=0).astype(np.float32)
-        return node, edges  # [N,P,d+], [N,P,P]
+        # --- 1. 准备一个标准化的、带自环的基础图 (base_edge) ---
+        # 这个操作只执行一次，得到的 base_edge 将被复用。
+        base_edge = consistent_mask.copy()
+        if self.adj_norm is not None and self.adj_norm != 'None':
+            # 这个函数会给图加上自环（I）并进行归一化，保证GCN计算稳定
+            base_edge = normalize_digraph(base_edge, norm_type=self.adj_norm)
 
+        # --- 2. 根据模式，使用 base_edge 进行组装 ---
+        if not self.build_large_graph:
+            # --- 小图模式 ---
+            # 对于批次中的每个样本，都使用这个相同的基础图。
+            edges = np.stack([base_edge] * B, axis=0).astype(np.float32)
+            return pxs, edges
+        else:
+            # --- 大图模式 ---
+            assert labels is not None, "构建大图需要提供标签 (labels)。"
+            
+            large_node_list = []
+            large_edge_list = []
+            random_state = np.random.RandomState(self.random_seed)
+            orig_shape = pxs.shape[2:]
 
+            for i in range(B):  # 为批次中的每个“锚点”样本构建一个大图
+                # a. 选择4个负样本 (逻辑不变)
+                current_label = labels[i]
+                opposite_indices = np.where(labels == 1 - current_label)[0]
+                if len(opposite_indices) < 4:
+                    # 如果负样本不够，允许重复采样
+                    selected_neg = random_state.choice(opposite_indices, 4, replace=True)
+                else:
+                    selected_neg = random_state.choice(opposite_indices, 4, replace=False)
+                
+                # b. 拼接大图的节点特征 (逻辑不变)
+                large_node = np.zeros((5 * P, *orig_shape), dtype=pxs.dtype)
+                large_node[:P] = pxs[i] # 第一个块是锚点样本
+                for neg_idx, global_idx in enumerate(selected_neg):
+                    start, end = (neg_idx + 1) * P, (neg_idx + 2) * P
+                    large_node[start:end] = pxs[global_idx]
+                large_node_list.append(large_node)
+
+                # c. 高效构建大图的邻接矩阵 (全新逻辑)
+                # 创建一个 5P x 5P 的空矩阵
+                large_edge = np.zeros((5 * P, 5 * P))
+                # 将处理好的 base_edge 作为“积木”填充到对角线上的5个块中
+                for s_idx in range(5):
+                    start, end = s_idx * P, (s_idx + 1) * P
+                    large_edge[start:end, start:end] = base_edge
+                large_edge_list.append(large_edge)
+                
+            large_nodes = np.stack(large_node_list, axis=0).astype(np.float32)
+            large_edges = np.stack(large_edge_list, axis=0).astype(np.float32)
+
+            return large_nodes, large_edges
+        
 def normalize_digraph(A, norm_type='DAD'):  # Normalized adjacency matrix
     flag = False
     if isinstance(A, torch.Tensor) and A.layout == torch.sparse_coo:
@@ -90,72 +128,3 @@ def Tensor2Sparse(Ad):
     data = Ad[idx[0], idx[1]]
     An = torch.sparse.FloatTensor(idx, data, Ad.shape)
     return An
-
-
-def cal_distance(coord, dist_type):
-    fore, after = [kk.lower() for kk in dist_type.split('_')]
-    if fore is not None:
-        A = cal_similarity_matrix(coord, type1=fore)
-    else:
-        raise ValueError('distance type?')
-
-    if after in ['gau', 'gaussian']:
-        sigma = np.std(A[np.triu_indices_from(A)])
-        A = np.exp(- A ** 2 / (2 * sigma ** 2))
-    elif after in ['1+gau']:
-        sigma = np.std(A[np.triu_indices_from(A)])
-        A = np.exp(- A ** 2 / (2 * sigma ** 2))
-        A += np.ones_like(A)
-    else:
-        raise ValueError('distance type?')
-
-    return A
-
-
-def cal_similarity_matrix(XA, type1):
-    if isinstance(XA, torch.Tensor):
-        P = XA.shape[0]
-        edge_square = torch.zeros((P, P)).to(XA.device)
-        for j in range(P):
-            for k in range(j, P):
-                edge_square[j, k] = cal_similarity_vector(XA[j, :], XA[k, :], type1=type1)
-                edge_square[k, j] = edge_square[j, k]
-        edge_square = torch.where(torch.isnan(edge_square), torch.full_like(edge_square, 0), edge_square)
-        assert sum(torch.isnan(edge_square)[0]) == 0
-
-    elif isinstance(XA, np.ndarray):
-        if type1 in ['euc', 'euclidean', 'l2']:  # Euclidean distance, smaller => higher similarity, diagonal=0
-            edge_square = cdist(XA, XA, metric='euclidean')
-        elif type1 in ['abspearson', 'abscorr']:
-            edge_square = abs(1 - cdist(XA, XA, metric='correlation'))
-        else:
-            raise ValueError('similarity type?')
-        edge_square[np.isnan(edge_square)] = 0.0
-        assert np.isnan(edge_square).sum() == 0
-
-    else:
-        raise ValueError('Unknown type of XA')
-    return edge_square
-
-
-def cal_similarity_vector(tensor1, tensor2, type1):
-    if isinstance(tensor1, torch.Tensor):
-        if type1 in ['euc', 'euclidean', 'l2']:
-            pdist = nn.PairwiseDistance(p=2)
-            return pdist(tensor1, tensor2)  # torch.norm(te1-te2, p=2)
-        elif type1 in ['abspearson', 'abscorr']:
-            vx = tensor1 - torch.mean(tensor1)
-            vy = tensor2 - torch.mean(tensor2)
-            cost = torch.abs(torch.sum(vx * vy) / (torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2))))
-            return cost  # np.corrcoef(x[i, j, :].data.cpu().numpy(), x[i, k, :].data.cpu().numpy())[0, 1]
-        else:
-            raise ValueError('similarity type?')
-    elif isinstance(tensor1, np.ndarray):
-        if type1 in ['euc', 'euclidean', 'l2']:
-            return ssp_dist.euclidean(tensor1, tensor2)  # np.linalg.norm(t1 - t2, ord=2)
-        elif type1 in ['abspearson', 'abscorr']:
-            return abs(np.corrcoef(tensor1, tensor2)[0, 1])
-        else:
-            raise ValueError('similarity type?')
-    else:
-        raise ValueError('Unknown type of tensor1')
