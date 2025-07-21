@@ -1,25 +1,39 @@
+# 基本配置
 exp_name: s1
 split_seed: 1449
 seed: 908
 fold: 0
 
-# hyper-parameters
-pre_epoch: 20
-num_epoch: 100
-LO: 1
-LR: 1
-LG: 0.002
+# 训练设置
+pre_epoch: 40
+num_epoch: 120
+inc_mode: lin  # 添加这一行，定义增长模式
+stage_transition_epoch: 70
+device: [0]
+batch_size: 33
+test_batch_size: 33
+
+# 优化器
+optimizer: SGD
 base_lr: 0.0001
-base_lr_mask: 16
+base_lr_mask: 4
+weight_decay: 0.0005
+nesterov: True
+scheduler: auto
 stepsize: 10
 gamma: 0.5
-scheduler: auto
 
-# data
-data_name: arising.ex202_2_0n0_pw9_r0.4
-patch_size: 9
+# 损失权重
+LC: 1
+LO: 1
+LCI: 1
+LCV: 1
+LG: 0.002
+lambda_l1: 0
 
-# feeder
+# 数据
+data_name: ADvsCN.ex001_2_p288_pw24_all
+patch_size: 24
 feeder: tools.feeder.FeederGraph
 train_feeder_args:
   debug: False
@@ -28,28 +42,21 @@ test_feeder_args:
   debug: False
   save: False
 
-# build graph
+# 图构建
 graph_args:
   node_type: px
   edge_type: abscorr
   dist_type: euc_1+gau
-  adj_norm: None
+  adj_norm: DAD
 
-# model
+# 模型
 model: net.networks
 model_args:
   hidden1: [32]
   kernels: [2]
-  hidden2: [8, 8, 8]
-
-# training
-# device: [0,1,2,3]
-device: [0]
-batch_size: 32
-test_batch_size: 32
-
-#optim
-optimizer: SGD
-weight_decay: 0.0005
-nesterov: True
-
+  hidden2: [32,16]
+  pretrained_path: "'预训练densenet/fold_1_feature_extractor.pth'"  # 使用双引号
+  freeze_extractor: True
+  
+#其它
+gumble_tau: 1
